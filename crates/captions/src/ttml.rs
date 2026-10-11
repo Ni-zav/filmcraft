@@ -423,7 +423,9 @@ pub fn parse(text: &str) -> Result<Document> {
     let Some(body) = root.children().find(|n| n.is_element() && n.tag_name().name() == "body") else {
         return Ok(doc);
     };
-    walk(body, Tick::ZERO, &tm, &styles, Fmt::default(), &mut doc);
+    // Body offsets are part of the document timeline, just like div offsets.
+    let (begin, end) = times(body, Tick::ZERO, &tm, &mut doc);
+    walk(body, begin.unwrap_or(Tick::ZERO), end, &tm, &styles, Fmt::default(), &mut doc);
     doc.cues.sort_by_key(|c| (c.start, c.end));
     Ok(doc)
 }
@@ -447,20 +449,36 @@ fn times(n: roxmltree::Node, parent: Tick, tm: &Timing, doc: &mut Document) -> (
     (begin, end)
 }
 
-fn walk(n: roxmltree::Node, parent: Tick, tm: &Timing, styles: &std::collections::HashMap<String, Fmt>, fmt: Fmt, doc: &mut Document) {
+/// An element cannot outlive its parent. Missing end/dur inherits the parent's
+/// finite end; an explicitly shorter interval keeps its own endpoint.
+fn bounded_end(end: Option<Tick>, parent_end: Option<Tick>) -> Option<Tick> {
+    match (end, parent_end) {
+        (Some(end), Some(parent_end)) => Some(end.min(parent_end)),
+        (Some(end), None) => Some(end),
+        (None, end) => end,
+    }
+}
+
+fn walk(n: roxmltree::Node, parent: Tick, parent_end: Option<Tick>, tm: &Timing, styles: &std::collections::HashMap<String, Fmt>, fmt: Fmt, doc: &mut Document) {
     for c in n.children().filter(|c| c.is_element()) {
         let f = style_of(c, styles, fmt);
         match c.tag_name().name() {
             "div" => {
-                let (b, _) = times(c, parent, tm, doc);
-                walk(c, b.unwrap_or(parent), tm, styles, f, doc);
+                let (b, e) = times(c, parent, tm, doc);
+                walk(c, b.unwrap_or(parent), bounded_end(e, parent_end), tm, styles, f, doc);
             }
             "p" => {
                 let (b, e) = times(c, parent, tm, doc);
                 let speaker = attr(c, "agent").map(|a| a.trim().trim_start_matches('_').replace('_', " "));
                 let id = c.attributes().find(|a| a.name() == "id").map(|a| a.value().to_string());
-                match (b, e) {
-                    (Some(b), Some(e)) => {
+                // Invalid explicit timing must not silently become an implicit
+                // begin/end. The time parser already recorded a warning.
+                if ["begin", "end", "dur"].into_iter().any(|key| attr(c, key).is_some_and(|value| parse_time(value, *tm).is_none())) {
+                    continue;
+                }
+                let start = b.unwrap_or(parent);
+                match bounded_end(e, parent_end) {
+                    Some(end) => {
                         let mut o = Out { s: String::new(), pending: false };
                         let tags: Vec<&str> = [(f.italic, "i"), (f.bold, "b"), (f.underline, "u")].into_iter().filter(|x| x.0).map(|x| x.1).collect();
                         for t in &tags {
@@ -471,13 +489,14 @@ fn walk(n: roxmltree::Node, parent: Tick, tm: &Timing, styles: &std::collections
                             o.s.push_str(&format!("</{t}>"));
                         }
                         let text = clean(&o.s);
-                        if e > b && !text.is_empty() {
-                            doc.cues.push(Cue { start: b, end: e, text, speaker, id, ..Default::default() });
+                        if end > start && !text.is_empty() {
+                            doc.cues.push(Cue { start, end, text, speaker, id, ..Default::default() });
                         }
                     }
-                    _ => {
-                        // untimed paragraph: its timed spans are the cues
-                        let base = b.unwrap_or(parent);
+                    None => {
+                        // A paragraph with no finite end still allows individually
+                        // timed spans to become cues.
+                        let base = start;
                         for sp in c.children().filter(|x| x.is_element() && x.tag_name().name() == "span") {
                             let (sb, se) = times(sp, base, tm, doc);
                             if let (Some(sb), Some(se)) = (sb, se) {
@@ -540,6 +559,55 @@ mod tests {
             assert_eq!(doc.cues.len(), 1, "{params}");
             assert_eq!(doc.cues[0].start, Tick(TICKS_PER_SECOND), "{params}");
             assert_eq!(doc.cues[0].end, Tick(2 * TICKS_PER_SECOND), "{params}");
+        }
+    }
+
+    #[test]
+    fn body_begin_offsets_descendant_timing() {
+        for format in [crate::Format::Ttml, crate::Format::Dfxp] {
+            for (body, div, expected) in [
+                (r#"begin="5s""#, "", (6, 7)),
+                ("", r#"begin="5s""#, (6, 7)),
+                ("", "", (1, 2)),
+            ] {
+                let xml = format!(
+                    r#"<tt xmlns="http://www.w3.org/ns/ttml"><body {body}><div {div}><p begin="1s" end="2s">x</p></div></body></tt>"#
+                );
+                let doc = crate::parse(xml.as_bytes(), format).unwrap();
+                assert_eq!(doc.cues.len(), 1, "{body} {div}");
+                assert_eq!(doc.cues[0].text, "x");
+                assert_eq!(doc.cues[0].start, Tick(expected.0 * TICKS_PER_SECOND));
+                assert_eq!(doc.cues[0].end, Tick(expected.1 * TICKS_PER_SECOND));
+                assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+            }
+        }
+    }
+
+    #[test]
+    fn paragraphs_inherit_finite_intervals_and_default_begin() {
+        let cases = [
+            (r#"<div begin="0s" end="5s"><p>Hello</p></div>"#, Some((0, 5, "Hello"))),
+            (r#"<div><p dur="2s">Hi</p></div>"#, Some((0, 2, "Hi"))),
+            (r#"<div><p begin="0s" end="5s">Hello</p></div>"#, Some((0, 5, "Hello"))),
+            (r#"<div><p begin="0s" dur="2s">Hi</p></div>"#, Some((0, 2, "Hi"))),
+            (r#"<div><p>Hello</p></div>"#, None),
+            (r#"<div begin="0s" end="5s"><p begin="2s" end="8s">Clipped</p></div>"#, Some((2, 5, "Clipped"))),
+        ];
+        for format in [crate::Format::Ttml, crate::Format::Dfxp] {
+            for (content, expected) in cases {
+                let xml = format!(r#"<tt xmlns="http://www.w3.org/ns/ttml"><body>{content}</body></tt>"#);
+                let doc = crate::parse(xml.as_bytes(), format).unwrap();
+                match expected {
+                    Some((start, end, text)) => {
+                        assert_eq!(doc.cues.len(), 1, "{content}");
+                        assert_eq!(doc.cues[0].start, Tick(start * TICKS_PER_SECOND));
+                        assert_eq!(doc.cues[0].end, Tick(end * TICKS_PER_SECOND));
+                        assert_eq!(doc.cues[0].text, text);
+                    }
+                    None => assert!(doc.cues.is_empty(), "{content}"),
+                }
+                assert!(doc.warnings.is_empty(), "{content}: {:?}", doc.warnings);
+            }
         }
     }
 
